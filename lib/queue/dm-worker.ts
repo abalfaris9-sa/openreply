@@ -285,7 +285,13 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 
     const alreadyDmd = existingLog?.status === "SENT";
     const alreadyPublicReplied = Boolean(existingLog?.publicReplySentAt);
-    const needsDm = !alreadyDmd && !existingLog?.dmDeliveryUnconfirmed;
+    const needsDm =
+      !alreadyDmd &&
+      !existingLog?.dmDeliveryUnconfirmed &&
+      !(
+        existingLog?.status === "FAILED" &&
+        isAmbiguousFailureMessage(existingLog.errorMessage)
+      );
 
     // Skip only when there is genuinely nothing left to do. A comment whose DM
     // already sent but whose public reply never posted (e.g. it hit a rate
@@ -486,8 +492,13 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       where: {
         automationId: automation.id,
         commenterId,
-        status: "SENT",
         commentId: { not: commentId },
+        OR: [
+          { status: "SENT" },
+          { dmDeliveryUnconfirmed: true },
+          { status: "FAILED", errorMessage: { contains: "[code=1 " } },
+          { status: "FAILED", errorMessage: { contains: "[code=2 " } },
+        ],
       },
       select: { id: true },
     });
@@ -763,12 +774,37 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed:
+            error instanceof ZernioDeliveryUnconfirmedError ||
+            isAmbiguousSendError(error),
         },
       });
+      // Meta sometimes answers a private reply with "unknown error" (code 1/2)
+      // even though the DM was delivered. Retrying then re-sends the same DM —
+      // on every BullMQ attempt and every 5-minute reconciler sweep — which is
+      // exactly what got the account restricted for harassment. Never retry an
+      // ambiguous send.
+      if (isAmbiguousSendError(error)) {
+        throw new UnrecoverableError(formatError(error));
+      }
       throw error;
     }
   }
+}
+
+/**
+ * A send whose outcome is unknown: Meta's generic code 1 ("An unknown error
+ * has occurred") / code 2 (temporary service error), or a non-Meta failure such
+ * as a network timeout. The DM may already be in the user's inbox.
+ */
+function isAmbiguousSendError(error: unknown): boolean {
+  if (error instanceof MetaApiError) return error.code === 1 || error.code === 2;
+  return !(error instanceof RateLimitError);
+}
+
+/** Same check against a stored log's errorMessage (for rows written earlier). */
+function isAmbiguousFailureMessage(message: string | null | undefined): boolean {
+  return Boolean(message && /\[code=(1|2) /.test(message));
 }
 
 async function sendPostbackOnce({
