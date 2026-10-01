@@ -478,6 +478,33 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       continue;
     }
 
+    // One DM per person per campaign. Meta allows one private reply per
+    // *comment*, so someone commenting the keyword 10 times would otherwise get
+    // 10 identical DMs — Instagram flags that as harassment and restricts
+    // messaging on the account. The public reply above still goes out.
+    const commenterAlreadyDmd = await prisma.dmLog.findFirst({
+      where: {
+        automationId: automation.id,
+        commenterId,
+        status: "SENT",
+        commentId: { not: commentId },
+      },
+      select: { id: true },
+    });
+    if (commenterAlreadyDmd) {
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: "SKIPPED_DEDUP",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage: "This person already received the DM from this campaign",
+        },
+      });
+      continue;
+    }
+
     const usage = await reserveWorkspaceDMSend(automation.workspaceId);
     if (!usage.allowed) {
       await prisma.dmLog.update({
@@ -821,25 +848,24 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     return;
   }
 
-  // Duplicate sends are enabled: every button tap re-sends the reveal
-  // instead of only firing once per person.
+  // One reveal per person per automation. Repeat button taps (or a bot on
+  // the other side tapping in a loop) must not re-send the link — Instagram
+  // treats repeated identical DMs as harassment and restricts messaging.
   const dedupeId = `reveal:${userId}`;
 
-  if (fallback) {
-    const existingReveal = await prisma.dmLog.findUnique({
-      where: {
-        automationId_commentId: {
-          automationId: automation.id,
-          commentId: dedupeId,
-        },
+  const existingReveal = await prisma.dmLog.findUnique({
+    where: {
+      automationId_commentId: {
+        automationId: automation.id,
+        commentId: dedupeId,
       },
-    });
-    if (
-      existingReveal?.status === "SENT" ||
-      existingReveal?.dmDeliveryUnconfirmed
-    )
-      return;
-  }
+    },
+  });
+  if (
+    existingReveal?.status === "SENT" ||
+    existingReveal?.dmDeliveryUnconfirmed
+  )
+    return;
 
   // Personalize {username} from the opening DM log for this user, if present.
   const openingLog = await prisma.dmLog.findFirst({
@@ -1162,6 +1188,24 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
     ) {
       continue;
     }
+
+    // Per-person cooldown: if this sender already received the link from this
+    // automation in the last 24h (via a button tap or an earlier DM), don't
+    // reply again. Stops loops with business accounts that auto-reply back.
+    const recentReveal = await prisma.dmLog.findFirst({
+      where: {
+        automationId: automation.id,
+        commenterId: senderId,
+        status: "SENT",
+        dmSentAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+        OR: [
+          { commentId: `reveal:${senderId}` },
+          { commentId: { startsWith: "dm:" } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (recentReveal) continue;
 
     const logBase = {
       workspaceId: automation.workspaceId,
