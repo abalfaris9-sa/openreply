@@ -637,6 +637,49 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           : alreadyFollows !== true;
     }
 
+    // Atomic per-person claim. Two jobs can reach this point for the same
+    // person at the same time (a webhook job and a reconciler sweep for one
+    // comment, two quick comments, or two worker processes on one queue) and
+    // both pass the read-only checks above. The unique (automationId,
+    // commentId) index lets exactly one of them create this marker row; the
+    // other skips instead of sending a second identical DM.
+    const claimId = `claim:${commenterId}`;
+    try {
+      await prisma.dmLog.create({
+        data: {
+          workspaceId: automation.workspaceId,
+          automationId: automation.id,
+          instagramAccountId: automation.instagramAccountId,
+          commenterId,
+          commenterName,
+          commentText,
+          commentId: claimId,
+          matchedKeyword: matchResult.matchedKeyword,
+          status: "SKIPPED_DEDUP",
+          errorMessage: `Send claim for comment ${commentId}`,
+        },
+      });
+    } catch (claimError) {
+      if ((claimError as { code?: string })?.code !== "P2002") throw claimError;
+      if (rateLimit?.reserved) {
+        await releaseDMSlot(instagramAccountId);
+      }
+      await releaseWorkspaceDMReservation(
+        automation.workspaceId,
+        usage.periodStart
+      );
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: "SKIPPED_DEDUP",
+          errorMessage: "Another job is already sending this person the DM",
+        },
+      });
+      continue;
+    }
+
     try {
       if (useOpeningDm) {
         const openingText = renderMessageWithTracking({
@@ -786,6 +829,20 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       // ambiguous send.
       if (isAmbiguousSendError(error)) {
         throw new UnrecoverableError(formatError(error));
+      }
+      // Definite failure (e.g. rate limit): the DM did not go out, so free the
+      // per-person claim and let the BullMQ retry try again.
+      try {
+        await prisma.dmLog.delete({
+          where: {
+            automationId_commentId: {
+              automationId: automation.id,
+              commentId: claimId,
+            },
+          },
+        });
+      } catch {
+        // claim already gone — nothing to release
       }
       throw error;
     }
